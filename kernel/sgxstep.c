@@ -35,6 +35,8 @@
 #include <linux/mm.h>
 #include <linux/highmem.h>
 #include <linux/slab.h>
+#include <linux/vmalloc.h>
+#include <linux/mutex.h>
 
 #include <linux/clockchips.h>
 #include <linux/version.h>
@@ -53,6 +55,8 @@ static void *g_isr_kernel_vbase = NULL;
 #endif
 
 static int g_in_use = 0;
+static pid_t g_owner_tgid;
+static DEFINE_MUTEX(g_step_lock);
 
 typedef struct {
     uint16_t size;
@@ -66,25 +70,74 @@ static uint32_t g_apic_lvtt_copy = 0x0, g_apic_tdcr_copy = 0x0;
 /* ********************** UTIL FUNCTIONS ******************************* */
 
 /*
- * NOTE: Linux's default `write_cr0` does not allow to change protected bits,
- * so we include our own here.
+ * Clearing CR0.WP is #GP(0) while CR4.CET = 1 (SDM, MOV to CR0). User
+ * shadow stacks set that bit, so the old WP toggle cannot patch the IDT.
+ * Copy the saved table through a writable alias of each leaf page instead.
  */
-inline void do_write_cr0(unsigned long val) {
-    asm volatile("mov %0, %%cr0" : : "r"(val));
+static bool idt_leaf_pfn(unsigned long addr, pte_t *pte, unsigned int level,
+                         unsigned long *pfn_out)
+{
+    unsigned long pfn = pte_pfn(*pte);
+
+    switch (level) {
+    case PG_LEVEL_4K:
+        break;
+    case PG_LEVEL_2M:
+        pfn += (addr & (PMD_SIZE - 1)) >> PAGE_SHIFT;
+        break;
+    case PG_LEVEL_1G:
+        pfn += (addr & (PUD_SIZE - 1)) >> PAGE_SHIFT;
+        break;
+    default:
+        return false;
+    }
+
+    *pfn_out = pfn;
+    return true;
 }
 
-void enable_write_protection(void)
+static int restore_idt_via_writable_map(void)
 {
-    unsigned long cr0 = read_cr0();
-    set_bit(16, &cr0);
-    do_write_cr0(cr0);
-}
+    unsigned long addr, end, done = 0;
+    const char *src;
 
-void disable_write_protection(void)
-{
-    unsigned long cr0 = read_cr0();
-    clear_bit(16, &cr0);
-    do_write_cr0(cr0);
+    if (!g_idt_copy || !g_idtr.base)
+        return -EINVAL;
+
+    addr = g_idtr.base;
+    end = addr + (unsigned long)g_idtr.size + 1;
+    src = g_idt_copy;
+
+    while (addr < end) {
+        unsigned int level = PG_LEVEL_NONE;
+        pte_t *pte;
+        unsigned long pfn = 0, page_off, chunk;
+        struct page *page;
+        void *mapped;
+
+        pte = lookup_address(addr, &level);
+        if (!pte || !pte_present(*pte) || !idt_leaf_pfn(addr, pte, level, &pfn)) {
+            err("cannot locate IDT page at %#lx", addr);
+            return -EINVAL;
+        }
+
+        page = pfn_to_page(pfn);
+        mapped = vmap(&page, 1, VM_MAP, PAGE_KERNEL);
+        if (!mapped) {
+            err("cannot map IDT page writable");
+            return -ENOMEM;
+        }
+
+        page_off = addr & ~PAGE_MASK;
+        chunk = min_t(unsigned long, PAGE_SIZE - page_off, end - addr);
+        memcpy((char *)mapped + page_off, src + done, chunk);
+        vunmap(mapped);
+
+        addr += chunk;
+        done += chunk;
+    }
+
+    return 0;
 }
 
 /* ********************** DEVICE OPEN ******************************* */
@@ -126,17 +179,29 @@ int save_apic(void)
 
 int step_open(struct inode *inode, struct file *file)
 {
-    if (g_in_use)
-    {
+    pid_t tgid = task_tgid_nr(current);
+    int ret = 0;
+
+    mutex_lock(&g_step_lock);
+    if (g_in_use == 0) {
+        ret = save_idt();
+        if (!ret)
+            ret = save_apic();
+        if (ret) {
+            kfree(g_idt_copy);
+            g_idt_copy = NULL;
+        } else {
+            g_owner_tgid = tgid;
+            g_in_use = 1;
+        }
+    } else if (g_owner_tgid != tgid) {
         err("Device is already opened");
-        return -EBUSY;
+        ret = -EBUSY;
+    } else {
+        g_in_use++;
     }
-
-    RET_ASSERT( !save_idt() );
-    RET_ASSERT( !save_apic() );
-
-    g_in_use = 1;
-    return 0;
+    mutex_unlock(&g_step_lock);
+    return ret;
 }
 
 /* ********************** DEVICE CLOSE ******************************* */
@@ -144,16 +209,13 @@ int step_open(struct inode *inode, struct file *file)
 /*
  * Restore original IDT to ensure no user pointers are left. Free kernel vbase
  * mappings and pinned user physical pages for any registered user ISRs.
- *
- * NOTE: the IDT virtual memory page is mapped write-protected by Linux, so we
- * have to disable CR0.WP temporarily here.
  */
 void restore_idt(void)
 {
-    disable_write_protection();
-    memcpy((void*)g_idtr.base, g_idt_copy, g_idtr.size+1);
-    enable_write_protection();
-    log("restored IDT: %#llx with size %u", g_idtr.base, g_idtr.size+1);
+    if (restore_idt_via_writable_map())
+        err("failed to restore IDT");
+    else
+        log("restored IDT: %#llx with size %u", g_idtr.base, g_idtr.size+1);
 
     kfree(g_idt_copy);
     g_idt_copy = NULL;
@@ -202,10 +264,15 @@ void restore_apic(void)
  */
 int step_release(struct inode *inode, struct file *file)
 {
-    restore_idt();
-    restore_apic();
-
-    g_in_use = 0;
+    mutex_lock(&g_step_lock);
+    if (g_in_use > 0)
+        g_in_use--;
+    if (g_in_use == 0) {
+        restore_idt();
+        restore_apic();
+        g_owner_tgid = 0;
+    }
+    mutex_unlock(&g_step_lock);
     return 0;
 }
 
