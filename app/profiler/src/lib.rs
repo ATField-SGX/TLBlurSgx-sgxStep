@@ -60,7 +60,6 @@ impl PageAccess {
 pub struct PageTable {
     pub page_table_map: Vec<Option<PageTableEntry>>,
     pub pages: Vec<PageAccess>,
-    pub accessed_ptes: Vec<(PageAccess, usize)>,
 }
 
 unsafe impl Sync for PageTable {}
@@ -71,7 +70,6 @@ impl PageTable {
         let mut page_table = Self {
             page_table_map: Vec::new(),
             pages: Vec::new(),
-            accessed_ptes: Vec::new(),
         };
 
         page_table.map_all_ptes(enclave.base() as usize, enclave.end() as usize);
@@ -121,7 +119,6 @@ impl PageTable {
                         page: i,
                     };
                     self.pages.push(p);
-                    self.accessed_ptes.push((p, i));
                 }
             }
         }
