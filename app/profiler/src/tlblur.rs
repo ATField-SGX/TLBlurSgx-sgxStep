@@ -51,6 +51,9 @@ pub struct PAM {
     pam_buffer: Vec<u64>,
     pam_active: Vec<PageAccess>,
     pam_counter: u64,
+    // Slot index is used as the page number. A masked host address can
+    // name a slot past the trace. That slot is not an enclave page.
+    page_limit: usize,
 }
 
 impl PAM {
@@ -59,6 +62,7 @@ impl PAM {
         pam_counter_address: *const c_void,
         pam_size: usize,
         pws_size: usize,
+        page_limit: usize,
     ) -> Self {
         Self {
             pam_enclave_mem: EnclaveMemory::new(pam_address as usize),
@@ -66,6 +70,7 @@ impl PAM {
             pam_buffer: vec![0; pam_size],
             pam_active: vec![PageAccess::default(); pws_size],
             pam_counter: 0,
+            page_limit,
         }
     }
 
@@ -103,6 +108,9 @@ impl PAM {
 
             let mut found = false;
             for (page, &value) in self.pam_buffer.iter().enumerate() {
+                if page >= self.page_limit {
+                    continue;
+                }
                 // Only update this entry in profiler PAM if it was recently updated.
                 if value >= new_counter - 1 && value > 0 {
                     self.pam_counter = new_counter;
@@ -539,11 +547,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         args.debug_sim_hwtlb.map(|f| create_dumper(&enclave, f));
     let mut page_table = PageTable::new(&enclave);
     let num_pages = page_table.page_table_map.len();
+    let page_limit = (enclave.size() as usize) / PAGE_SIZE_4KiB as usize + 100;
     let mut pam = PAM::new(
         pam_address as *mut c_void,
         pam_counter_address as *mut c_void,
         num_pages * 8,
         args.pws_size,
+        page_limit,
     );
     let write_erip = args.write_erip;
     let no_prefetch = args.no_prefetch;

@@ -147,6 +147,11 @@ impl VCDStatefulSet {
 
     fn update_state(&mut self, writer: &mut vcd::Writer<File>, items: &[usize]) {
         for &item in items {
+            // Prefetch math and a bad instrumented address can name a page
+            // outside the enclave. That is not a trace slot.
+            if item >= self.state.len() {
+                continue;
+            }
             if !self.state[item] {
                 self.state[item] = true;
                 writer.change_scalar(self.vars[item], true).unwrap();
